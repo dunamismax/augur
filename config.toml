@@ -1,0 +1,26 @@
+[ibkr]
+host = "127.0.0.1"
+port = 7497          # 7497 = paper TWS, 4001 = live Gateway, 4002 = paper Gateway
+client_id = 1
+timeout = 30
+account = ""         # leave empty for auto-detect
+
+[claude]
+model = "claude-opus-4-6"
+max_tokens = 4096
+backend = "cli"            # "cli" = Claude Max via claude CLI, "api" = Anthropic API key
+
+[risk]
+max_position_pct = 40.0          # max single position as % of portfolio
+max_sector_pct = 60.0            # max sector concentration as % of portfolio
+max_daily_loss_pct = 5.0         # max daily loss as % of portfolio
+max_leverage = 2.0               # max leverage ratio
+require_stop_loss = true         # every position must have a stop-loss
+allow_naked_options = false      # no naked calls/puts until explicitly enabled
+paper_trading = true             # start in paper trading mode
+
+[watchlist]
+symbols = ["SPY", "QQQ", "XLE", "XLF", "AAPL", "MSFT", "GOOGL", "AMZN", "NVDA", "TSLA"]
+
+[database]
+path = "data/trades.db"

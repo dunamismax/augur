@@ -1,0 +1,55 @@
+[project]
+name = "scry-trader"
+version = "0.1.0"
+description = "AI-assisted, human-directed trading system built on Claude and Interactive Brokers"
+readme = "README.md"
+authors = [
+    { name = "dunamismax", email = "dunamismax@tutamail.com" },
+]
+requires-python = ">=3.12"
+dependencies = [
+    "ib-async",
+    "anthropic",
+    "click",
+    "rich",
+    "pydantic>=2.0",
+    "httpx",
+    "pandas",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest",
+    "pytest-asyncio",
+    "ruff",
+    "mypy",
+    "pandas-stubs",
+]
+
+[project.scripts]
+scry-trader = "scry_trader.cli:main"
+
+[build-system]
+requires = ["uv_build>=0.10.7,<0.11.0"]
+build-backend = "uv_build"
+
+[tool.ruff]
+target-version = "py312"
+line-length = 99
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "N", "UP", "B", "SIM", "TCH"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+warn_return_any = true
+warn_unused_configs = true
+
+[[tool.mypy.overrides]]
+module = ["ib_async.*"]
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
