@@ -50,6 +50,10 @@ cd augur
 # Install (requires uv)
 uv sync --all-extras
 
+# NOTE: If upgrading from the old scry-trader repo name, delete and recreate
+# your venv — shebangs will point to the old path and break all tooling.
+#   rm -rf .venv && uv sync --all-extras
+
 # Configure
 cp config.toml.example config.toml
 # Edit config.toml with your IBKR and Anthropic API settings
