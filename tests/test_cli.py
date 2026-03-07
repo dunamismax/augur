@@ -58,6 +58,15 @@ async def _async_return[T](value: T) -> T:
 @pytest.fixture(autouse=True)
 def confirm_orders(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(cli.click, "confirm", lambda prompt: True)
+    monkeypatch.setattr(
+        cli.click,
+        "prompt",
+        lambda text, **kwargs: (
+            "REVIEWED"
+            if "Type REVIEWED" in text
+            else "Fresh catalyst with defined invalidation and exit plan."
+        ),
+    )
 
 
 def test_buy_flow_overrides_llm_symbol_and_side_and_logs_fill(
@@ -110,6 +119,8 @@ def test_buy_flow_overrides_llm_symbol_and_side_and_logs_fill(
     assert open_trades[0].ticker == "AAPL"
     assert open_trades[0].direction == Direction.LONG
     assert open_trades[0].shares == 10
+    assert open_trades[0].thesis == "Fresh catalyst with defined invalidation and exit plan."
+    assert open_trades[0].claude_analysis == "buy test"
 
 
 def test_sell_flow_partial_fill_closes_only_filled_lot_quantity(
@@ -181,6 +192,8 @@ def test_sell_flow_partial_fill_closes_only_filled_lot_quantity(
     ]
     assert len(closed) == 1
     assert closed[0].shares == 40
+    assert "Operator rationale:" in closed[0].notes
+    assert "Claude rationale: partial exit" in closed[0].notes
 
 
 def test_sell_flow_can_flip_from_long_to_short(
@@ -313,6 +326,77 @@ def test_bracket_flow_uses_parent_fill_for_journal(
     assert len(open_trades) == 1
     assert open_trades[0].entry_price == 101.5
     assert open_trades[0].shares == 20
+
+
+def test_reducing_sell_with_bracket_levels_submits_single_order(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    db_path = tmp_path / "trades.db"
+    journal = Journal(db_path)
+    journal.add_trade(
+        cli.TradeJournalEntry(
+            ticker="AAPL",
+            direction=Direction.LONG,
+            entry_price=95.0,
+            shares=100,
+            thesis="core position",
+        )
+    )
+
+    monkeypatch.setattr(cli, "_load", lambda: _app_config(db_path))
+    FakeAnalyst.order_spec = OrderSpec(
+        symbol="AAPL",
+        action=OrderAction.SELL,
+        quantity=150,
+        order_type=OrderType.MARKET,
+        reference_price=100.0,
+        take_profit_price=94.0,
+        stop_loss_price=105.0,
+        reason="flip with attached exits",
+    )
+    monkeypatch.setattr(cli, "Analyst", FakeAnalyst)
+    monkeypatch.setattr(cli, "Broker", FakeBroker)
+    monkeypatch.setattr(
+        cli,
+        "_get_portfolio_and_quote",
+        lambda broker, symbol: _async_return(
+            (
+                AccountSummary(
+                    total_value=100_000,
+                    buying_power=100_000,
+                    positions=[Position(symbol=symbol, quantity=100, avg_cost=95.0)],
+                ),
+                WatchlistItem(symbol=symbol, last_price=100.0),
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        cli,
+        "_submit_bracket",
+        lambda broker, spec: pytest.fail("reducing or flip orders must not submit brackets"),
+    )
+    monkeypatch.setattr(
+        cli,
+        "_submit_order",
+        lambda broker, spec: _async_return(
+            OrderResult(
+                order_id=13,
+                symbol=spec.symbol,
+                action=spec.action,
+                quantity=spec.quantity,
+                status="Filled",
+                filled_price=100.0,
+                filled_quantity=150,
+            )
+        ),
+    )
+
+    cli._trade_flow("AAPL", OrderAction.SELL, shares=None, limit_price=None)
+
+    updated_journal = Journal(db_path)
+    short_lots = updated_journal.get_open_lots(ticker="AAPL", direction=Direction.SHORT)
+    assert len(short_lots) == 1
+    assert short_lots[0].shares == 50
 
 
 def test_rejected_order_does_not_touch_journal(

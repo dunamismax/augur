@@ -3,13 +3,14 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from datetime import datetime, timedelta
 from typing import TYPE_CHECKING
 
-from augur.models import Direction, OrderAction, OrderType
+from augur.models import Direction, OrderAction, OrderType, TradeOutcome
 
 if TYPE_CHECKING:
     from augur.config import RiskConfig
-    from augur.models import AccountSummary, OrderSpec
+    from augur.models import AccountSummary, OrderSpec, TradeJournalEntry
 
 
 @dataclass
@@ -39,6 +40,26 @@ class OrderExposure:
     @property
     def is_reducing_only(self) -> bool:
         return self.reducing_quantity > 0 and self.opening_quantity == 0
+
+
+@dataclass(frozen=True)
+class TradeChallengeResult:
+    """Deterministic pre-trade review to slow the operator down before submission."""
+
+    thesis: str
+    entry_price: float | None
+    stop_loss_price: float | None
+    take_profit_price: float | None
+    opening_quantity: float
+    reducing_quantity: float
+    post_trade_quantity: float
+    max_loss: float | None = None
+    max_loss_pct: float | None = None
+    reward_risk_ratio: float | None = None
+    post_trade_position_pct: float | None = None
+    blockers: list[str] = field(default_factory=list)
+    warnings: list[str] = field(default_factory=list)
+    prompts: list[str] = field(default_factory=list)
 
 
 class RiskManager:
@@ -205,6 +226,156 @@ class RiskManager:
 
         passed = len(violations) == 0
         return RiskCheckResult(passed=passed, violations=violations, warnings=warnings)
+
+    def challenge_trade(
+        self,
+        order: OrderSpec,
+        portfolio: AccountSummary,
+        thesis: str,
+        trade_history: list[TradeJournalEntry],
+        *,
+        now: datetime | None = None,
+    ) -> TradeChallengeResult:
+        """Build a deterministic adversarial review for a proposed trade."""
+        review_time = now or datetime.now()
+        normalized_thesis = " ".join(thesis.split())
+        entry_price = _estimate_price(order) or None
+        exposure = classify_order_exposure(order, portfolio)
+        blockers: list[str] = []
+        warnings: list[str] = []
+        prompts: list[str] = []
+
+        if not normalized_thesis:
+            blockers.append("Operator thesis / exit rationale is required before submission.")
+        elif len(normalized_thesis.split()) < 5:
+            warnings.append(
+                "Operator thesis is thin. State the edge, catalyst, and invalidation in one line."
+            )
+
+        if exposure.opening_quantity > 0:
+            prompts.append("What evidence would prove this trade wrong before the stop is hit?")
+        else:
+            prompts.append("Is this exit following the plan or reacting to recent price action?")
+
+        if exposure.reducing_quantity > 0 and exposure.opening_quantity > 0:
+            warnings.append(
+                "This order flips the position in one step. Confirm the new thesis is stronger "
+                "than the old one."
+            )
+        if (
+            exposure.reducing_quantity > 0
+            and order.take_profit_price is not None
+            and order.stop_loss_price is not None
+        ):
+            warnings.append(
+                "Attached exit orders will not be sent because this order reduces or flips an "
+                "existing position. Split the trade if you want a separate bracket on the new "
+                "exposure."
+            )
+
+        current_position = next(
+            (position for position in portfolio.positions if position.symbol == order.symbol),
+            None,
+        )
+        if (
+            current_position is not None
+            and current_position.unrealized_pnl < 0
+            and exposure.opening_direction is not None
+        ):
+            current_direction = (
+                Direction.LONG if current_position.quantity > 0 else Direction.SHORT
+            )
+            if current_direction == exposure.opening_direction:
+                warnings.append(
+                    f"You are adding to a losing {current_direction.value} position in "
+                    f"{order.symbol}."
+                )
+                prompts.append("Why add here instead of waiting for strength to confirm?")
+
+        if exposure.opening_quantity > 0:
+            recent_losses = [
+                trade
+                for trade in trade_history
+                if trade.outcome == TradeOutcome.LOSS
+                and (trade.exit_date or trade.entry_date) is not None
+                and review_time - (trade.exit_date or trade.entry_date or review_time)
+                <= timedelta(days=14)
+            ]
+            if recent_losses:
+                recent_loss = max(
+                    recent_losses,
+                    key=lambda trade: trade.exit_date or trade.entry_date or review_time,
+                )
+                loss_date = (recent_loss.exit_date or recent_loss.entry_date or review_time).date()
+                warnings.append(
+                    f"{order.symbol} had a losing journal entry on {loss_date.isoformat()}. "
+                    "Confirm this is a fresh setup, not a revenge trade."
+                )
+                prompts.append("What is meaningfully different from that losing setup?")
+
+        max_loss: float | None = None
+        max_loss_pct: float | None = None
+        reward_risk_ratio: float | None = None
+        post_trade_position_pct: float | None = None
+
+        if entry_price is not None and portfolio.total_value > 0:
+            post_trade_value = abs(exposure.post_trade_quantity) * entry_price
+            if post_trade_value > 0:
+                post_trade_position_pct = (post_trade_value / portfolio.total_value) * 100
+                if post_trade_position_pct >= self.config.max_position_pct * 0.75:
+                    warnings.append(
+                        f"Post-trade {order.symbol} concentration would be "
+                        f"{post_trade_position_pct:.1f}% of portfolio."
+                    )
+
+        if (
+            exposure.opening_quantity > 0
+            and entry_price is not None
+            and order.stop_loss_price is not None
+        ):
+            risk_per_share = abs(entry_price - order.stop_loss_price)
+            if risk_per_share == 0:
+                warnings.append("Stop-loss matches entry. Confirm that this is intentional.")
+            else:
+                max_loss = risk_per_share * exposure.opening_quantity
+                if portfolio.total_value > 0:
+                    max_loss_pct = (max_loss / portfolio.total_value) * 100
+                    if max_loss_pct >= self.config.max_daily_loss_pct * 0.5:
+                        warnings.append(
+                            f"Loss to stop is {max_loss_pct:.2f}% of portfolio, a large "
+                            "fraction of the daily loss guardrail."
+                        )
+
+                if order.take_profit_price is not None:
+                    reward_per_share = (
+                        order.take_profit_price - entry_price
+                        if order.action == OrderAction.BUY
+                        else entry_price - order.take_profit_price
+                    )
+                    reward_risk_ratio = reward_per_share / risk_per_share
+                    if reward_risk_ratio < 1.5:
+                        warnings.append(
+                            f"Reward/risk is only {reward_risk_ratio:.2f}:1."
+                        )
+                else:
+                    prompts.append("Where do you expect to take profits if the trade works?")
+
+        return TradeChallengeResult(
+            thesis=normalized_thesis,
+            entry_price=entry_price,
+            stop_loss_price=order.stop_loss_price,
+            take_profit_price=order.take_profit_price,
+            opening_quantity=exposure.opening_quantity,
+            reducing_quantity=exposure.reducing_quantity,
+            post_trade_quantity=exposure.post_trade_quantity,
+            max_loss=max_loss,
+            max_loss_pct=max_loss_pct,
+            reward_risk_ratio=reward_risk_ratio,
+            post_trade_position_pct=post_trade_position_pct,
+            blockers=blockers,
+            warnings=warnings,
+            prompts=prompts,
+        )
 
 
 def _estimate_order_value(order: OrderSpec) -> float:

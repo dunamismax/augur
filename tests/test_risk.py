@@ -1,5 +1,7 @@
 """Tests for risk management module."""
 
+from datetime import datetime
+
 from augur.config import RiskConfig
 from augur.models import (
     AccountSummary,
@@ -8,6 +10,8 @@ from augur.models import (
     OrderSpec,
     OrderType,
     Position,
+    TradeJournalEntry,
+    TradeOutcome,
 )
 from augur.risk import RiskManager, classify_order_exposure
 
@@ -272,6 +276,124 @@ class TestPortfolioHealth:
         portfolio = _make_portfolio(total_value=0)
         result = rm.check_portfolio_health(portfolio)
         assert result.ok
+
+
+class TestTradeChallenge:
+    def test_challenge_trade_computes_loss_and_reward(self) -> None:
+        rm = RiskManager(_default_config())
+        order = _make_order(
+            quantity=100,
+            limit_price=150.0,
+            stop_loss_price=145.0,
+        )
+        order.take_profit_price = 165.0
+
+        challenge = rm.challenge_trade(
+            order,
+            _make_portfolio(total_value=100_000),
+            "Breakout with catalyst and clear invalidation below support.",
+            [],
+            now=datetime(2026, 3, 7, 9, 30),
+        )
+
+        assert challenge.blockers == []
+        assert challenge.max_loss == 500.0
+        assert challenge.max_loss_pct == 0.5
+        assert challenge.reward_risk_ratio == 3.0
+        assert challenge.post_trade_position_pct == 15.0
+
+    def test_challenge_trade_requires_operator_thesis(self) -> None:
+        rm = RiskManager(_default_config())
+        challenge = rm.challenge_trade(
+            _make_order(),
+            _make_portfolio(),
+            "   ",
+            [],
+            now=datetime(2026, 3, 7, 9, 30),
+        )
+
+        assert challenge.blockers
+        assert "thesis" in challenge.blockers[0].lower()
+
+    def test_challenge_trade_flags_recent_loss_and_adding_to_loser(self) -> None:
+        rm = RiskManager(_default_config())
+        order = _make_order(quantity=50, limit_price=140.0, stop_loss_price=132.0)
+        history = [
+            TradeJournalEntry(
+                ticker="AAPL",
+                direction=Direction.LONG,
+                entry_price=150.0,
+                exit_price=142.0,
+                shares=25,
+                entry_date=datetime(2026, 3, 1),
+                exit_date=datetime(2026, 3, 5),
+                outcome=TradeOutcome.LOSS,
+            )
+        ]
+        portfolio = _make_portfolio(
+            positions=[
+                Position(
+                    symbol="AAPL",
+                    quantity=100,
+                    avg_cost=150.0,
+                    market_value=14_000.0,
+                    unrealized_pnl=-1_000.0,
+                )
+            ]
+        )
+
+        challenge = rm.challenge_trade(
+            order,
+            portfolio,
+            "Adding on planned retest with defined invalidation and catalyst.",
+            history,
+            now=datetime(2026, 3, 7, 9, 30),
+        )
+
+        warning_text = " ".join(challenge.warnings).lower()
+        prompt_text = " ".join(challenge.prompts).lower()
+        assert "adding to a losing" in warning_text
+        assert "losing journal entry" in warning_text
+        assert "waiting for strength" in prompt_text
+        assert "different from that losing setup" in prompt_text
+
+    def test_challenge_trade_does_not_flag_revenge_trade_on_pure_exit(self) -> None:
+        rm = RiskManager(_default_config())
+        order = _make_order(
+            action=OrderAction.SELL,
+            quantity=50,
+            limit_price=140.0,
+            stop_loss_price=145.0,
+        )
+        history = [
+            TradeJournalEntry(
+                ticker="AAPL",
+                direction=Direction.LONG,
+                entry_price=150.0,
+                exit_price=142.0,
+                shares=25,
+                entry_date=datetime(2026, 3, 1),
+                exit_date=datetime(2026, 3, 5),
+                outcome=TradeOutcome.LOSS,
+            )
+        ]
+        portfolio = _make_portfolio(
+            positions=[Position(symbol="AAPL", quantity=100, avg_cost=150.0)]
+        )
+
+        challenge = rm.challenge_trade(
+            order,
+            portfolio,
+            "Planned trim into resistance after the thesis weakened.",
+            history,
+            now=datetime(2026, 3, 7, 9, 30),
+        )
+
+        warning_text = " ".join(challenge.warnings).lower()
+        prompt_text = " ".join(challenge.prompts).lower()
+        assert "losing journal entry" not in warning_text
+        assert "revenge trade" not in warning_text
+        assert "different from that losing setup" not in prompt_text
 
 
 class TestExposureClassification:

@@ -42,6 +42,9 @@ augur/
 - `augur portfolio` shows account summary plus positions.
 - `augur watch [SYMBOL ...]` returns quote snapshots. It is not a streaming terminal view.
 - `augur analyze`, `augur ask`, `augur buy`, `augur sell`, `augur risk`, and `augur journal` all exist.
+- `buy` and `sell` now capture an operator thesis / exit rationale, run a deterministic challenge review, and only then allow submission.
+- Attached bracket exits only go out with net-new exposure; reduction / flip orders submit as a single parent order so the CLI does not quietly stage opposite-side child orders against an existing position.
+- `journal` now surfaces the saved thesis so later review reflects the human decision, not just the model-generated order reason.
 - `augur alerts` is still a placeholder.
 
 ### Portfolio Data Honesty
@@ -52,6 +55,7 @@ augur/
 
 ### Highest-Value Remaining Work
 
+- Validate the challenge review flow against a real IBKR paper session and confirm the live quote used for pre-trade loss math matches operator expectations.
 - Verify the portfolio-feed path against a real IBKR paper session and confirm multi-account scoping behaves as expected.
 - Decide whether missing marked-to-market portfolio data should warn loudly or hard-fail instead of silently falling back.
 - Improve connection resilience and state reporting; transient IBKR disconnects still fail the command.
@@ -62,7 +66,9 @@ augur/
 ## Verification Snapshot
 
 ```
-python -m compileall src tests
+UV_CACHE_DIR=/tmp/uv-cache-copy uv run --offline ruff check src tests
+UV_CACHE_DIR=/tmp/uv-cache-copy uv run --offline --extra dev mypy src
+UV_CACHE_DIR=/tmp/uv-cache-copy uv run --offline --extra dev pytest
 ```
 
 Last verified: 2026-03-07

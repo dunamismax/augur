@@ -20,10 +20,10 @@ augur portfolio     # Positions, P&L, allocation
 augur watch [SYM]   # Quote snapshots for watchlist or specific symbols
 augur analyze TICKER # Deep Claude analysis with entry/exit/risk levels
 augur ask "question" # Free-form question with portfolio context
-augur buy TICKER     # Interactive buy flow with Claude sizing
-augur sell TICKER    # Interactive sell flow
+augur buy TICKER     # Interactive buy flow with thesis capture + challenge review
+augur sell TICKER    # Interactive sell flow with exit rationale + challenge review
 augur risk           # Portfolio risk assessment (rules + Claude)
-augur journal        # Trade journal with stats and filtering
+augur journal        # Trade journal with stats, filtering, and thesis visibility
 ```
 
 ## Architecture
@@ -73,9 +73,10 @@ uv run ruff check src/ tests/
 ## Design Principles
 
 - **Human-in-the-loop.** Claude recommends, you confirm. No autonomous trading.
+- **Decision forcing.** Orders now require an operator thesis / exit rationale and show a deterministic challenge review before submission.
 - **Risk-first.** Rule-based guardrails run before every order. Portfolio health checks are always available.
 - **CLI-native.** No web UI. Terminal is the interface. Rich tables, colored P&L, structured output.
-- **Journaled.** Every trade and analysis is logged for review.
+- **Journaled.** Every trade and analysis is logged for review, including the operator thesis that justified the fill.
 
 ## License
 

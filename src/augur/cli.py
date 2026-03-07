@@ -28,7 +28,7 @@ from augur.models import (
     TradeOutcome,
     WatchlistItem,
 )
-from augur.risk import RiskManager, classify_order_exposure
+from augur.risk import RiskManager, TradeChallengeResult, classify_order_exposure
 
 if TYPE_CHECKING:
     from collections.abc import Coroutine
@@ -304,18 +304,36 @@ def analyze(ticker: str, question: str) -> None:
 @click.argument("ticker")
 @click.option("--shares", type=float, help="Number of shares (overrides Claude recommendation)")
 @click.option("--limit", "limit_price", type=float, help="Limit price")
-def buy(ticker: str, shares: float | None, limit_price: float | None) -> None:
+@click.option(
+    "--thesis",
+    help="Operator thesis / exit rationale captured before submission and stored in journal",
+)
+def buy(
+    ticker: str,
+    shares: float | None,
+    limit_price: float | None,
+    thesis: str | None,
+) -> None:
     """Interactive buy flow with Claude sizing recommendation."""
-    _trade_flow(ticker.upper(), OrderAction.BUY, shares, limit_price)
+    _trade_flow(ticker.upper(), OrderAction.BUY, shares, limit_price, thesis)
 
 
 @main.command()
 @click.argument("ticker")
 @click.option("--shares", type=float, help="Number of shares to sell")
 @click.option("--limit", "limit_price", type=float, help="Limit price")
-def sell(ticker: str, shares: float | None, limit_price: float | None) -> None:
+@click.option(
+    "--thesis",
+    help="Operator thesis / exit rationale captured before submission and stored in journal",
+)
+def sell(
+    ticker: str,
+    shares: float | None,
+    limit_price: float | None,
+    thesis: str | None,
+) -> None:
     """Interactive sell flow."""
-    _trade_flow(ticker.upper(), OrderAction.SELL, shares, limit_price)
+    _trade_flow(ticker.upper(), OrderAction.SELL, shares, limit_price, thesis)
 
 
 def _trade_flow(
@@ -323,6 +341,7 @@ def _trade_flow(
     action: OrderAction,
     shares: float | None,
     limit_price: float | None,
+    thesis: str | None = None,
 ) -> None:
     config = _load()
     analyst = Analyst(config.claude, config.risk)
@@ -369,6 +388,9 @@ def _trade_flow(
             location = ".".join(str(part) for part in error["loc"])
             console.print(f"  [red]- {location}:[/red] {error['msg']}")
         sys.exit(1)
+    exposure = classify_order_exposure(order_spec, portfolio)
+
+    operator_thesis = _capture_operator_thesis(ticker, action, thesis)
 
     # Display the order
     console.print()
@@ -386,6 +408,29 @@ def _trade_flow(
         console.print("\n[red]Order blocked by risk management.[/red]")
         return
 
+    challenge = risk_mgr.challenge_trade(
+        order_spec,
+        portfolio,
+        operator_thesis,
+        j.get_trades_by_ticker(ticker),
+    )
+    console.print()
+    _display_trade_challenge(challenge, config)
+    if challenge.blockers:
+        for blocker in challenge.blockers:
+            console.print(f"[red]CHALLENGE BLOCKER:[/red] {blocker}")
+        console.print("\n[red]Order cancelled before submission.[/red]")
+        return
+    if challenge.warnings:
+        review_ack = click.prompt(
+            "Type REVIEWED to confirm you've considered the challenge",
+            default="",
+            show_default=False,
+        )
+        if review_ack.strip().upper() != "REVIEWED":
+            console.print("[dim]Order cancelled.[/dim]")
+            return
+
     # Confirm
     console.print()
     if not click.confirm("Submit this order?"):
@@ -395,7 +440,11 @@ def _trade_flow(
     # Submit
     primary_result: OrderResult | None = None
     try:
-        if order_spec.take_profit_price and order_spec.stop_loss_price:
+        if (
+            order_spec.take_profit_price
+            and order_spec.stop_loss_price
+            and exposure.reducing_quantity == 0
+        ):
             results = _run(_submit_bracket(broker, order_spec))
             for r in results:
                 console.print(
@@ -449,6 +498,7 @@ def _trade_flow(
         fill_price=entry_price,
         order_spec=order_spec,
         portfolio=portfolio,
+        operator_thesis=operator_thesis,
     )
     if realized:
         entry_label = "entry" if realized == 1 else "entries"
@@ -518,10 +568,12 @@ def _journal_fills(
     fill_price: float,
     order_spec: OrderSpec,
     portfolio: AccountSummary,
+    operator_thesis: str,
 ) -> int:
     filled_spec = order_spec.model_copy(update={"quantity": filled_quantity})
     exposure = classify_order_exposure(filled_spec, portfolio, quantity=filled_quantity)
     updates = 0
+    rationale_note = _compose_rationale_note(operator_thesis, order_spec.reason)
 
     if exposure.reducing_quantity > 0 and exposure.reducing_direction is not None:
         closed_lots = journal.close_position(
@@ -529,7 +581,7 @@ def _journal_fills(
             direction=exposure.reducing_direction,
             shares=exposure.reducing_quantity,
             exit_price=fill_price,
-            notes=order_spec.reason,
+            notes=rationale_note,
         )
         updates += len(closed_lots)
         closed_quantity = sum(lot.shares for lot in closed_lots)
@@ -548,7 +600,8 @@ def _journal_fills(
                 shares=exposure.opening_quantity,
                 open_shares=exposure.opening_quantity,
                 entry_date=datetime.now(),
-                thesis=order_spec.reason,
+                thesis=operator_thesis,
+                claude_analysis=order_spec.reason,
             )
         )
         updates += 1
@@ -662,6 +715,7 @@ def journal(ticker: str | None, open_only: bool, stats: bool, count: int) -> Non
     table.add_column("Shares", justify="right")
     table.add_column("P&L", justify="right")
     table.add_column("Outcome")
+    table.add_column("Thesis")
     table.add_column("Date")
 
     for t in trades:
@@ -681,6 +735,7 @@ def journal(ticker: str | None, open_only: bool, stats: bool, count: int) -> Non
             f"{t.shares:,.0f}" if t.shares else "—",
             _colored_pnl(t.pnl) if t.outcome != TradeOutcome.OPEN else "—",
             f"[{outcome_style}]{t.outcome.value.upper()}[/{outcome_style}]",
+            _summarize_text(t.thesis or t.notes or t.claude_analysis),
             t.entry_date.strftime("%Y-%m-%d") if t.entry_date else "—",
         )
 
@@ -730,3 +785,86 @@ def _colored_pct(value: float) -> str:
     elif value < 0:
         return f"[red]{value:.2f}%[/red]"
     return "0.00%"
+
+
+def _capture_operator_thesis(
+    ticker: str,
+    action: OrderAction,
+    thesis: str | None,
+) -> str:
+    if thesis is None:
+        prompt_label = (
+            "Operator thesis" if action == OrderAction.BUY else "Operator exit rationale"
+        )
+        thesis = click.prompt(
+            f"{prompt_label} for {ticker}",
+            default="",
+            show_default=False,
+        )
+    return " ".join(thesis.split())
+
+
+def _display_trade_challenge(
+    challenge: TradeChallengeResult,
+    config: AppConfig,
+) -> None:
+    account_mode = "PAPER" if config.risk.paper_trading else "LIVE"
+    table = Table(title="Decision Challenge", show_header=False, border_style="magenta")
+    table.add_column("Field", style="bold")
+    table.add_column("Value")
+
+    table.add_row("Account Mode", account_mode)
+    table.add_row("Configured Account", config.ibkr.account or "—")
+    table.add_row("Opening Qty", f"{challenge.opening_quantity:,.0f}")
+    if challenge.reducing_quantity > 0:
+        table.add_row("Reducing Qty", f"{challenge.reducing_quantity:,.0f}")
+    table.add_row("Post-Trade Qty", f"{challenge.post_trade_quantity:,.0f}")
+    if challenge.entry_price is not None:
+        table.add_row("Planned Entry", f"${challenge.entry_price:,.2f}")
+    if challenge.stop_loss_price is not None:
+        table.add_row("Stop Loss", f"${challenge.stop_loss_price:,.2f}")
+    if challenge.take_profit_price is not None:
+        table.add_row("Take Profit", f"${challenge.take_profit_price:,.2f}")
+    if challenge.max_loss is not None:
+        loss_text = f"${challenge.max_loss:,.2f}"
+        if challenge.max_loss_pct is not None:
+            loss_text += f" ({challenge.max_loss_pct:.2f}% of portfolio)"
+        table.add_row("Loss to Stop", loss_text)
+    if challenge.reward_risk_ratio is not None:
+        table.add_row("Reward/Risk", f"{challenge.reward_risk_ratio:.2f}:1")
+    if challenge.post_trade_position_pct is not None:
+        table.add_row("Post-Trade Size", f"{challenge.post_trade_position_pct:.1f}% of portfolio")
+
+    console.print(Panel(challenge.thesis or "—", title="Operator Thesis", border_style="cyan"))
+    console.print(table)
+
+    for warning in challenge.warnings:
+        console.print(f"[yellow]Challenge:[/yellow] {warning}")
+
+    if challenge.prompts:
+        challenge_text = "\n".join(f"  - {prompt}" for prompt in challenge.prompts)
+        console.print(
+            Panel(
+                challenge_text,
+                title="Adversarial Questions",
+                border_style="yellow",
+            )
+        )
+
+
+def _compose_rationale_note(operator_thesis: str, claude_reason: str) -> str:
+    notes: list[str] = []
+    if operator_thesis:
+        notes.append(f"Operator rationale: {operator_thesis}")
+    if claude_reason:
+        notes.append(f"Claude rationale: {claude_reason}")
+    return "\n".join(notes)
+
+
+def _summarize_text(value: str, limit: int = 36) -> str:
+    cleaned = " ".join(value.split())
+    if not cleaned:
+        return "—"
+    if len(cleaned) <= limit:
+        return cleaned
+    return f"{cleaned[: limit - 1]}…"
